@@ -338,7 +338,7 @@ traj = p.model.add_subsystem('traj', dm.Trajectory())
 
 phase0 = traj.add_phase('phase0',
     dm.Phase(ode_class=VehicleODE,
-             transcription=dm.Radau(num_segments=15, order=3)))
+             transcription=dm.Radau(num_segments=20, order=3)))
 
 # Add the phase to the model
 p.model.linear_solver = om.DirectSolver()
@@ -351,9 +351,9 @@ phase0.set_time_options(fix_initial=True, fix_duration=False, units='s')
 phase0.add_state('h', fix_initial=True, fix_final=True, units='m', rate_source='hdot',
                  lower=0, ref=40000)
 phase0.add_state('theta', fix_initial=True, fix_final=True, units='rad', rate_source='thetadot',
-                 lower=0, upper=np.radians(10))
+                 lower=0, upper=np.radians(6))
 phase0.add_state('phi', fix_initial=True, fix_final=True, units='rad', rate_source='phidot',
-                 lower=0, upper=np.radians(5))
+                 lower=0, upper=np.radians(3))
 phase0.add_state('v', fix_initial=True, fix_final=False, units='m/s', rate_source='vdot',
                  lower=0, ref=2000)
 phase0.add_state('gamma', fix_initial=True, fix_final=False, units='rad', rate_source='gammadot',
@@ -363,14 +363,19 @@ phase0.add_state('psi', fix_initial=True, fix_final=False, units='rad', rate_sou
 
 # Control input (bank angle sigma)
 phase0.add_control('sigma', units='rad', opt=True,
-                   lower=np.radians(-89), upper=np.radians(89))
+                   lower=np.radians(-1), upper=np.radians(165))
 phase0.add_control('alpha', units='rad', opt=True,
-                   lower=np.radians(-89), upper=np.radians(89))
+                   lower=np.radians(0), upper=np.radians(40))
+
+#phase0.add_boundary_constraint('alpha', loc='initial', equals=np.radians(40))
+
 
 # Objective 1: maximize final theta (longitude) downrange distance
 # phase0.add_objective('theta', loc='final', ref=-0.01)
 # Objective 2: maximize final velocity
-phase0.add_objective('v', loc='final', ref=-1.0)
+phase0.add_objective('v', loc='final', ref=-100.0)
+
+
 
 
 # Setup the problem
@@ -381,9 +386,9 @@ phase0.set_time_val(initial=0.0, duration=2000, units='s')
 
 # Boundary conditions from Vedantam & Grant Table 2
 phase0.set_state_val('h', [40000.0, 0.0], units='m')
-phase0.set_state_val('theta', [0.0, np.radians(5.0)], units='rad')
-phase0.set_state_val('phi', [0.0, np.radians(1.0)], units='rad')
-phase0.set_state_val('v', [2000.0, 1500.0], units='m/s')  # final free but initialized
+phase0.set_state_val('theta', [0.0, np.radians(3.7)], units='rad')
+phase0.set_state_val('phi', [0.0, np.radians(0.01)], units='rad')
+phase0.set_state_val('v', [2000.0, 1100.0], units='m/s')  # final free but initialized
 phase0.set_state_val('gamma', [0.0, -0.2], units='rad')
 phase0.set_state_val('psi', [0.0, 0.1], units='rad')
 
@@ -391,7 +396,7 @@ phase0.set_state_val('psi', [0.0, 0.1], units='rad')
 phase0.set_control_val('sigma', [np.radians(0.0), np.radians(0.0)])
 phase0.set_control_val('alpha', [np.radians(0.0), np.radians(0.0)])
 
-p.check_partials(compact_print=True, method='cs')  # or 'fd'
+#p.check_partials(compact_print=True, method='cs')  # or 'fd'
 
 # Run the problem
 dm.run_problem(p, simulate=True)
@@ -408,7 +413,6 @@ plot_results([
 ], title='Vedantam-Grant Controls', p_sol=sol, p_sim=sim)
 
 plt.tight_layout()
-plt.show()
 
 # Plot state variables
 plot_results([
@@ -427,6 +431,60 @@ plot_results([
     ('traj.phase0.timeseries.time', 'traj.phase0.timeseries.psi',
      'Time (s)', 'Heading Angle ψ (rad)')
 ], title='Vedantam-Grant State', p_sol=sol, p_sim=sim)
+
+# Earth's radius in meters (can use same radius as in your model)
+R_e = 6371000.0
+
+# Pull longitude and latitude from timeseries
+theta_sol = sol.get_val('traj.phase0.timeseries.theta')  # longitude (rad)
+phi_sol = sol.get_val('traj.phase0.timeseries.phi')      # latitude (rad)
+
+theta_sim = sim.get_val('traj.phase0.timeseries.theta')
+phi_sim = sim.get_val('traj.phase0.timeseries.phi')
+
+"""
+# Convert to meters (optional)
+downrange_sol = R_e * theta_sol
+crossrange_sol = R_e * phi_sol
+
+downrange_sim = R_e * theta_sim
+crossrange_sim = R_e * phi_sim
+"""
+
+# Convert to deg
+downrange_sol = 180 * theta_sol / np.pi
+crossrange_sol = 180 * phi_sol / np.pi
+
+downrange_sim = 180 * theta_sim / np.pi
+crossrange_sim = 180 * phi_sim / np.pi
+
+# Plotting
+plt.figure(figsize=(8,6))
+plt.plot(downrange_sol, crossrange_sol, 'o', label='solution')   # km
+plt.plot(downrange_sim, crossrange_sim, '-', label='simulation') # km
+plt.xlabel('Downrange (deg)')
+plt.ylabel('Crossrange (deg)')
+plt.title('Vehicle Ground Track (Crossrange vs Downrange)')
+plt.grid(True)
+plt.legend()
+plt.axis('equal')  # preserve aspect ratio
+
+# Extract altitude and velocity from the solution timeseries
+altitude_sol = sol.get_val('traj.phase0.timeseries.h')  # in meters
+velocity_sol = sol.get_val('traj.phase0.timeseries.v')  # in m/s
+
+# Convert altitude to km and velocity to km/s
+altitude_km = altitude_sol / 1000.0
+velocity_kms = velocity_sol / 1000.0
+
+# Plotting
+plt.figure(figsize=(8,6))
+plt.plot(velocity_kms, altitude_km, 'b-')
+plt.xlabel('Velocity (km/s)')
+plt.ylabel('Altitude (km)')
+plt.title('Altitude vs. Velocity')
+plt.grid(True)
+plt.tight_layout()
 
 plt.tight_layout()
 plt.show()
