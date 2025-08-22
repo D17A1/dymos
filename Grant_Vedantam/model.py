@@ -5,6 +5,14 @@ import matplotlib.pyplot as plt
 import openmdao.api as om
 from openmdao.api import Group
 from dymos.examples.plotting import plot_results
+from openmdao.utils.general_utils import set_pyoptsparse_opt
+
+
+# Define Center of Debris Field
+phi0 = np.radians(0.05)
+theta0 = np.radians(2.0)
+h0 = 26000.0
+debris_radius = 1000.0
 
 class Atmosphere(om.ExplicitComponent):
     """
@@ -98,10 +106,71 @@ class Aerodynamics(om.ExplicitComponent):
         J['drag', 'v'] = rho * v * A_ref * CD
         J['drag', 'rho'] = 0.5 * v**2 * CD * A_ref
 
+class DebrisDistance(om.ExplicitComponent):
+    """
+    Finds distance from vehicle to debris field center
+    Converts from angle to meters
+    Distance found using pythagorean
+    """
+
+    def initialize(self):
+        self.options.declare('num_nodes', types=int)
+
+    def setup(self):
+        nn = self.options['num_nodes']
+
+        self.add_input('phi', shape=(nn,), units='rad')     # latitude
+        self.add_input('theta', shape=(nn,), units='rad')   # longitude
+        self.add_input('h', shape=(nn,), units='m')         # altitude
+
+        self.add_output('dist_to_debris', shape=(nn,), units='m')
+
+        ar = np.arange(nn)
+        self.declare_partials('dist_to_debris', 'phi', rows=ar, cols=ar)
+        self.declare_partials('dist_to_debris', 'theta', rows=ar, cols=ar)
+        self.declare_partials('dist_to_debris', 'h', rows=ar, cols=ar)
+
+    def compute(self, inputs, outputs):
+        R_e = 6371000.0
+        phi = inputs['phi']
+        theta = inputs['theta']
+        h = inputs['h']
+
+        dphi = phi - phi0
+        dtheta = theta - theta0
+        dh = h - h0
+
+        # Convert to meters
+        dphi = dphi * R_e
+        dtheta = dtheta * R_e
+
+        outputs['dist_to_debris'] = np.sqrt(dphi**2 + dtheta**2 + dh**2)  # Euclidean approximation
+
+    def compute_partials(self, inputs, partials):
+        R_e = 6371000.0
+        phi = inputs['phi']
+        theta = inputs['theta']
+        h = inputs['h']
+
+        dphi = phi - phi0
+        dtheta = theta - theta0
+        dh = h - h0
+
+        dphi = dphi * R_e
+        dtheta = dtheta * R_e
+        denom = np.sqrt(dphi**2 + dtheta**2)
+
+        # Avoid division by zero
+        denom = np.where(denom < 1e-8, 1e-8, denom)
+
+        partials['dist_to_debris', 'phi'] = dphi / denom
+        partials['dist_to_debris', 'theta'] = dtheta / denom
+        partials['dist_to_debris', 'h'] = dh / denom
 
 class FlightDynamics(om.ExplicitComponent):
     """
     Defines the dynamics of the vehicle
+    3-DOF
     """
 
     def initialize(self):
@@ -185,7 +254,7 @@ class FlightDynamics(om.ExplicitComponent):
         drag = inputs['drag']
 
         # Constants
-        mu = 3.986e14                   # gravitational parameter [m^3/s^2]
+        mu = 3.986e14                   # gravitational constant [m^3/s^2]
         m = 340.1943                    # mass of vehicle [kg]
         A_ref = 0.2919                  # reference area (used for L/D if needed)
     
@@ -201,7 +270,7 @@ class FlightDynamics(om.ExplicitComponent):
         sin_sigma = np.sin(sigma)
         cos_sigma = np.cos(sigma)
     
-        # Equations of motion from Vedantam & Grant
+        # Equations of motion from Vedantam Grant
         outputs['hdot'] = v * sin_gamma
         outputs['thetadot'] = v * cos_gamma * cos_psi / (r * cos_phi)   # longitude
         outputs['phidot'] = v * cos_gamma * sin_psi / r                 # latitude
@@ -280,8 +349,8 @@ class FlightDynamics(om.ExplicitComponent):
         J['gammadot', 'h'] = 2 * mu * cos_gamma / (v * r**3) - v * cos_gamma / (r**2)
 
         # Check for zeros
-        if np.any(np.abs(lift) < 1e-8):
-            print("Zero lift at node(s):", np.where(np.abs(lift) < 1e-8))
+        #if np.any(np.abs(lift) < 1e-8):
+        #    print("Zero lift at node(s):", np.where(np.abs(lift) < 1e-8))
 
         # Partial derivatives of eqn 1f
         J['psidot', 'lift'] = sin_sigma / (m * v * cos_gamma)
@@ -315,6 +384,12 @@ class VehicleODE(Group):
                            promotes_inputs=['alpha', 'v', 'rho'],
                            promotes_outputs=['lift', 'drag'])
 
+        # Debris avoidance constraint
+        self.add_subsystem('debris_dist',
+                           subsys=DebrisDistance(num_nodes=nn),
+                           promotes_inputs=['phi', 'theta', 'h'],
+                           promotes_outputs=['dist_to_debris'])
+
         # Dynamics model: 6-DOF planar dynamics using Vedantam/Grant equations
         self.add_subsystem('eom',
                            subsys=FlightDynamics(num_nodes=nn),
@@ -329,22 +404,34 @@ class VehicleODE(Group):
 
 # Create the OpenMDAO problem
 p = om.Problem(model=om.Group())
+_, optimizer = set_pyoptsparse_opt('SLSQP', fallback=False)
+
 p.driver = om.pyOptSparseDriver()
 p.driver.declare_coloring()
-p.driver.options['optimizer'] = 'SLSQP'
+
+p.driver.options['optimizer'] = optimizer
+p.driver.options['print_results'] = True
+
+# IPOPT causing issues
+if optimizer == 'IPOPT':
+    p.driver.opt_settings['print_level'] = 0
+    p.driver.opt_settings['mu_strategy'] = 'adaptive'
+    p.driver.opt_settings['bound_mult_init_method'] = 'mu-based'
+    p.driver.opt_settings['mu_init'] = 0.01
+    p.driver.opt_settings['nlp_scaling_method'] = 'gradient-based'
 
 # Define the trajectory and add the phase
 traj = p.model.add_subsystem('traj', dm.Trajectory())
 
 phase0 = traj.add_phase('phase0',
     dm.Phase(ode_class=VehicleODE,
-             transcription=dm.Radau(num_segments=20, order=3)))
+             transcription=dm.Radau(num_segments=10, order=3)))
 
 # Add the phase to the model
 p.model.linear_solver = om.DirectSolver()
 p.model.nonlinear_solver = om.NewtonSolver(solve_subsystems=True)
 
-# Set time options
+# Set time options, will be single phase (glide)
 phase0.set_time_options(fix_initial=True, fix_duration=False, units='s')
 
 # Define state variables
@@ -367,16 +454,14 @@ phase0.add_control('sigma', units='rad', opt=True,
 phase0.add_control('alpha', units='rad', opt=True,
                    lower=np.radians(0), upper=np.radians(40))
 
-#phase0.add_boundary_constraint('alpha', loc='initial', equals=np.radians(40))
-
+# Enforce a minimum distance to stay outside the debris field
+phase0.add_path_constraint('dist_to_debris', lower=debris_radius)
+phase0.add_timeseries_output('dist_to_debris', shape=(1,))
 
 # Objective 1: maximize final theta (longitude) downrange distance
 # phase0.add_objective('theta', loc='final', ref=-0.01)
 # Objective 2: maximize final velocity
 phase0.add_objective('v', loc='final', ref=-100.0)
-
-
-
 
 # Setup the problem
 p.setup(check=True)
@@ -386,8 +471,8 @@ phase0.set_time_val(initial=0.0, duration=2000, units='s')
 
 # Boundary conditions from Vedantam & Grant Table 2
 phase0.set_state_val('h', [40000.0, 0.0], units='m')
-phase0.set_state_val('theta', [0.0, np.radians(3.7)], units='rad')
-phase0.set_state_val('phi', [0.0, np.radians(0.01)], units='rad')
+phase0.set_state_val('theta', [0.0, np.radians(4.4)], units='rad')
+phase0.set_state_val('phi', [0.0, np.radians(0.1)], units='rad')
 phase0.set_state_val('v', [2000.0, 1100.0], units='m/s')  # final free but initialized
 phase0.set_state_val('gamma', [0.0, -0.2], units='rad')
 phase0.set_state_val('psi', [0.0, 0.1], units='rad')
@@ -407,12 +492,15 @@ sim = om.CaseReader(traj.sim_prob.get_outputs_dir() / 'dymos_simulation.db').get
 plot_results([
     ('traj.phase0.timeseries.time', 'traj.phase0.timeseries.sigma',
      'Time (s)', 'Bank Angle σ (rad)'),
-
     ('traj.phase0.timeseries.time', 'traj.phase0.timeseries.alpha',
-     'Time (s)', 'Angle of Attack α (rad)')
+     'Time (s)', 'Angle of Attack α (rad)'),
+    ('traj.phase0.timeseries.time', 'traj.phase0.timeseries.dist_to_debris',
+               'time (s)', 'Distance (m)')
 ], title='Vedantam-Grant Controls', p_sol=sol, p_sim=sim)
-
 plt.tight_layout()
+
+# Get minimum distance to debris along entire flight
+print(min(sol.get_val('traj.phase0.timeseries.dist_to_debris')))
 
 # Plot state variables
 plot_results([
@@ -432,7 +520,7 @@ plot_results([
      'Time (s)', 'Heading Angle ψ (rad)')
 ], title='Vedantam-Grant State', p_sol=sol, p_sim=sim)
 
-# Earth's radius in meters (can use same radius as in your model)
+# Earth's radius in meters
 R_e = 6371000.0
 
 # Pull longitude and latitude from timeseries
@@ -443,7 +531,7 @@ theta_sim = sim.get_val('traj.phase0.timeseries.theta')
 phi_sim = sim.get_val('traj.phase0.timeseries.phi')
 
 """
-# Convert to meters (optional)
+# Convert to meters
 downrange_sol = R_e * theta_sol
 crossrange_sol = R_e * phi_sol
 
@@ -458,12 +546,16 @@ crossrange_sol = 180 * phi_sol / np.pi
 downrange_sim = 180 * theta_sim / np.pi
 crossrange_sim = 180 * phi_sim / np.pi
 
-# Plotting
+# Plots top down view cross vs down range
 plt.figure(figsize=(8,6))
 plt.plot(downrange_sol, crossrange_sol, 'o', label='solution')   # km
 plt.plot(downrange_sim, crossrange_sim, '-', label='simulation') # km
 plt.xlabel('Downrange (deg)')
 plt.ylabel('Crossrange (deg)')
+plt.plot(sol.get_val('traj.phase0.timeseries.theta'),
+         sol.get_val('traj.phase0.timeseries.phi'))
+
+plt.scatter(np.degrees(theta0), np.degrees(phi0), c='r', label='Debris Field Center')
 plt.title('Vehicle Ground Track (Crossrange vs Downrange)')
 plt.grid(True)
 plt.legend()
@@ -473,11 +565,13 @@ plt.axis('equal')  # preserve aspect ratio
 altitude_sol = sol.get_val('traj.phase0.timeseries.h')  # in meters
 velocity_sol = sol.get_val('traj.phase0.timeseries.v')  # in m/s
 
+
 # Convert altitude to km and velocity to km/s
 altitude_km = altitude_sol / 1000.0
 velocity_kms = velocity_sol / 1000.0
 
-# Plotting
+"""
+# Plots Velocity vs Alt
 plt.figure(figsize=(8,6))
 plt.plot(velocity_kms, altitude_km, 'b-')
 plt.xlabel('Velocity (km/s)')
@@ -485,7 +579,19 @@ plt.ylabel('Altitude (km)')
 plt.title('Altitude vs. Velocity')
 plt.grid(True)
 plt.tight_layout()
+"""
 
+altitude_sim = sim.get_val('traj.phase0.timeseries.h')  # in meters
+
+# Plots alt vs downrange
+plt.figure(figsize=(8,6))
+plt.plot(downrange_sol, altitude_sol, 'o', label='solution')   
+plt.plot(downrange_sim, altitude_sim, '-', label='simulation') 
+plt.scatter(np.degrees(theta0), h0, c='r', label='Debris Center')
+plt.xlabel('Downrange (rad)')
+plt.ylabel('Altitude (m)')
+plt.title('Altitude vs. Downrange')
+plt.grid(True)
 plt.tight_layout()
-plt.show()
 
+plt.show()
