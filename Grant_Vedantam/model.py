@@ -9,10 +9,10 @@ from openmdao.utils.general_utils import set_pyoptsparse_opt
 
 
 # Define Center of Debris Field
-phi0 = np.radians(0.05)
-theta0 = np.radians(2.0)
-h0 = 26000.0
-debris_radius = 1000.0
+phi0 = np.radians(1.0)
+theta0 = np.radians(2.35)
+h0 = 23800.0
+debris_radius = 10000.0
 
 class Atmosphere(om.ExplicitComponent):
     """
@@ -158,7 +158,7 @@ class DebrisDistance(om.ExplicitComponent):
 
         dphi = dphi * R_e
         dtheta = dtheta * R_e
-        denom = np.sqrt(dphi**2 + dtheta**2)
+        denom = np.sqrt(dphi**2 + dtheta**2 + dh**2)
 
         # Avoid division by zero
         denom = np.where(denom < 1e-8, 1e-8, denom)
@@ -402,9 +402,57 @@ class VehicleODE(Group):
                                'gammadot', 'psidot'
                            ])
 
+import numpy as np
+import matplotlib.pyplot as plt
+
+def CirclePlot(center_x, center_y, radius_m, view='topdown', earth_radius=6371000.0, **plot_kwargs):
+    """
+    Generate x and y coordinates for a circle for plotting with plt.plot().
+
+    Parameters
+    ----------
+    center_x : float
+        Center x-coordinate (radians).
+    center_y : float
+        Center y-coordinate (radians for 'topdown', meters for 'lateral').
+    radius_m : float
+        Radius of the circle in meters.
+    view : str
+        'topdown' (crossrange vs downrange in radians) or 'lateral' (altitude vs downrange).
+    earth_radius : float
+        Radius of Earth in meters (default: 6371000).
+    **plot_kwargs : dict
+        Additional keyword arguments passed to plt.plot().
+
+    Returns
+    -------
+    None
+    """
+    theta = np.linspace(0, 2 * np.pi, 200)
+    
+    if view == 'topdown':
+        # Convert radius to radians for both axes
+        dx = (radius_m / earth_radius) * np.cos(theta)
+        dy = (radius_m / earth_radius) * np.sin(theta)
+        x = center_x + dx
+        y = center_y + dy
+    elif view == 'lateral':
+        # x is radians, y is meters
+        dx = (radius_m / earth_radius) * np.cos(theta)
+        dy = radius_m * np.sin(theta)
+        x = center_x + dx
+        y = center_y + dy
+    else:
+        raise ValueError("view must be either 'topdown' or 'lateral'")
+
+    plt.plot(x, y, **plot_kwargs)
+
+
+
 # Create the OpenMDAO problem
 p = om.Problem(model=om.Group())
-_, optimizer = set_pyoptsparse_opt('SLSQP', fallback=False)
+_, optimizer = set_pyoptsparse_opt('IPOPT', fallback=False)
+#_, optimizer = set_pyoptsparse_opt('SLSQP', fallback=False)
 
 p.driver = om.pyOptSparseDriver()
 p.driver.declare_coloring()
@@ -412,20 +460,24 @@ p.driver.declare_coloring()
 p.driver.options['optimizer'] = optimizer
 p.driver.options['print_results'] = True
 
+
 # IPOPT causing issues
 if optimizer == 'IPOPT':
     p.driver.opt_settings['print_level'] = 0
     p.driver.opt_settings['mu_strategy'] = 'adaptive'
     p.driver.opt_settings['bound_mult_init_method'] = 'mu-based'
-    p.driver.opt_settings['mu_init'] = 0.01
+    p.driver.opt_settings['mu_init'] = 0.1
     p.driver.opt_settings['nlp_scaling_method'] = 'gradient-based'
+    p.driver.opt_settings['constr_viol_tol'] = 1e-4
+    p.driver.opt_settings['compl_inf_tol'] = 1e-4
+    p.driver.opt_settings['tol'] = 1e-5
 
 # Define the trajectory and add the phase
 traj = p.model.add_subsystem('traj', dm.Trajectory())
 
 phase0 = traj.add_phase('phase0',
     dm.Phase(ode_class=VehicleODE,
-             transcription=dm.Radau(num_segments=10, order=3)))
+             transcription=dm.Radau(num_segments=10)))
 
 # Add the phase to the model
 p.model.linear_solver = om.DirectSolver()
@@ -440,13 +492,14 @@ phase0.add_state('h', fix_initial=True, fix_final=True, units='m', rate_source='
 phase0.add_state('theta', fix_initial=True, fix_final=True, units='rad', rate_source='thetadot',
                  lower=0, upper=np.radians(6))
 phase0.add_state('phi', fix_initial=True, fix_final=True, units='rad', rate_source='phidot',
-                 lower=0, upper=np.radians(3))
+                 lower=-np.radians(3), upper=np.radians(3))
 phase0.add_state('v', fix_initial=True, fix_final=False, units='m/s', rate_source='vdot',
                  lower=0, ref=2000)
-phase0.add_state('gamma', fix_initial=True, fix_final=False, units='rad', rate_source='gammadot',
-                 lower=np.radians(-90), upper=np.radians(90))
-phase0.add_state('psi', fix_initial=True, fix_final=False, units='rad', rate_source='psidot',
-                 lower=0, upper=2 * np.pi)
+# Changed from free to fixed final
+phase0.add_state('gamma', fix_initial=True, fix_final=True, units='rad', rate_source='gammadot',
+                 lower=-np.radians(89), upper=np.radians(89))
+phase0.add_state('psi', fix_initial=True, fix_final=True, units='rad', rate_source='psidot',
+                 lower=-np.radians(180), upper=np.radians(180))
 
 # Control input (bank angle sigma)
 phase0.add_control('sigma', units='rad', opt=True,
@@ -455,13 +508,15 @@ phase0.add_control('alpha', units='rad', opt=True,
                    lower=np.radians(0), upper=np.radians(40))
 
 # Enforce a minimum distance to stay outside the debris field
-phase0.add_path_constraint('dist_to_debris', lower=debris_radius)
+#phase0.add_path_constraint('dist_to_debris', lower=debris_radius)
 phase0.add_timeseries_output('dist_to_debris', shape=(1,))
 
 # Objective 1: maximize final theta (longitude) downrange distance
-# phase0.add_objective('theta', loc='final', ref=-0.01)
+#phase0.add_objective('phi', loc='final', ref=-0.01)
 # Objective 2: maximize final velocity
-phase0.add_objective('v', loc='final', ref=-100.0)
+phase0.add_objective('v', loc='final', ref=-1.0)
+# Objective 3: minimize time
+#phase0.add_objective('t', loc='final', ref=1.0)
 
 # Setup the problem
 p.setup(check=True)
@@ -471,11 +526,11 @@ phase0.set_time_val(initial=0.0, duration=2000, units='s')
 
 # Boundary conditions from Vedantam & Grant Table 2
 phase0.set_state_val('h', [40000.0, 0.0], units='m')
-phase0.set_state_val('theta', [0.0, np.radians(4.4)], units='rad')
+phase0.set_state_val('theta', [0.0, np.radians(3.5)], units='rad')
 phase0.set_state_val('phi', [0.0, np.radians(0.1)], units='rad')
 phase0.set_state_val('v', [2000.0, 1100.0], units='m/s')  # final free but initialized
-phase0.set_state_val('gamma', [0.0, -0.2], units='rad')
-phase0.set_state_val('psi', [0.0, 0.1], units='rad')
+phase0.set_state_val('gamma', [0.0, -np.radians(45)], units='rad')
+phase0.set_state_val('psi', [0.0, np.radians(0)], units='rad')
 
 # Bank angle control guess (sigma)
 phase0.set_control_val('sigma', [np.radians(0.0), np.radians(0.0)])
@@ -554,8 +609,9 @@ plt.xlabel('Downrange (deg)')
 plt.ylabel('Crossrange (deg)')
 plt.plot(sol.get_val('traj.phase0.timeseries.theta'),
          sol.get_val('traj.phase0.timeseries.phi'))
-
 plt.scatter(np.degrees(theta0), np.degrees(phi0), c='r', label='Debris Field Center')
+CirclePlot(center_x=np.degrees(theta0), center_y=np.degrees(phi0), radius_m=debris_radius,
+           view='topdown', color='red', linestyle='--', label='Debris Radius')
 plt.title('Vehicle Ground Track (Crossrange vs Downrange)')
 plt.grid(True)
 plt.legend()
@@ -564,7 +620,6 @@ plt.axis('equal')  # preserve aspect ratio
 # Extract altitude and velocity from the solution timeseries
 altitude_sol = sol.get_val('traj.phase0.timeseries.h')  # in meters
 velocity_sol = sol.get_val('traj.phase0.timeseries.v')  # in m/s
-
 
 # Convert altitude to km and velocity to km/s
 altitude_km = altitude_sol / 1000.0
@@ -588,7 +643,9 @@ plt.figure(figsize=(8,6))
 plt.plot(downrange_sol, altitude_sol, 'o', label='solution')   
 plt.plot(downrange_sim, altitude_sim, '-', label='simulation') 
 plt.scatter(np.degrees(theta0), h0, c='r', label='Debris Center')
-plt.xlabel('Downrange (rad)')
+CirclePlot(center_x=np.degrees(theta0), center_y=h0, radius_m=debris_radius,
+           view='lateral', color='red', linestyle='--', label='Debris Radius')
+plt.xlabel('Downrange (deg)')
 plt.ylabel('Altitude (m)')
 plt.title('Altitude vs. Downrange')
 plt.grid(True)
