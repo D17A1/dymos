@@ -6,6 +6,8 @@ import openmdao.api as om
 from openmdao.api import Group
 from dymos.examples.plotting import plot_results
 from openmdao.utils.general_utils import set_pyoptsparse_opt
+import plotly.graph_objects as go
+import plotly.io as pio
 
 
 # Define Center of Debris Field
@@ -651,4 +653,31 @@ plt.title('Altitude vs. Downrange')
 plt.grid(True)
 plt.tight_layout()
 
+# Create 3D plot of trajectory
+x = theta_sim
+y = phi_sim
+z = altitude_sim
+
+fig = go.Figure(data=[go.Scatter3d(
+    x=x,
+    y=y,
+    z=z,
+    mode='lines+markers',
+    line=dict(width=4),
+    marker=dict(size=2),
+)])
+
+fig.update_layout(
+    scene=dict(
+        xaxis_title='X',
+        yaxis_title='Y',
+        zaxis_title='Z',
+    ),
+    title="3D Trajectory of Hypersonic Vehicle",
+    margin=dict(l=0, r=0, b=0, t=40)
+)
+
+pio.renderers.default = 'browser'
+
+fig.show()
 plt.show()
