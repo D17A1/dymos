@@ -9,6 +9,8 @@ x = np.sin(t)
 y = np.cos(t)
 z = t
 
+print (z)
+
 fig = go.Figure(data=[go.Scatter3d(x=x, y=y, z=z, mode='lines')])
 fig.update_layout(title='3D Spiral')
 fig.show()

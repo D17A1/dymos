@@ -90,17 +90,31 @@ plt.title('Altitude vs. Downrange')
 plt.grid(True)
 plt.tight_layout()
 
-# Create 3D plot of trajectory
-x = theta_sol * R_e
-y = phi_sol * R_e
-z = altitude_sol
-
 pio.renderers.default = 'browser'
 
-fig = go.Figure(data=[go.Scatter3d(x=x, y=y, z=z, mode='lines')])
+# Create 3D plot of trajectory
+x = np.degrees(theta_sim)
+y = np.degrees(phi_sim)
+z = altitude_sim / 1000.0  # Convert altitude to km
+
+x = np.array(x).flatten()
+y = np.array(y).flatten()
+z = np.array(z).flatten()
+
+for i in range(len(x)):
+    print(x[i],y[i],z[i])
+
+fig = go.Figure(data=[go.Scatter3d(x=x, y=y, z=z, mode='lines', line=dict(width=3))])
 
 fig.update_layout(
+    scene=dict(
+        xaxis_title='Downrange (deg)',
+        yaxis_title='Cross range (deg)',
+        zaxis_title='Altitude (km)',
+        aspectratio=dict(x=3, y=1, z=1)
+    ),
     title="3D Trajectory of Hypersonic Vehicle",
+    margin=dict(l=0, r=0, b=0, t=40)
 )
 
 
