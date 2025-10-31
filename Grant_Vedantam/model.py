@@ -477,10 +477,15 @@ if optimizer == 'IPOPT':
 # Define the trajectory and add the phase
 traj = p.model.add_subsystem('traj', dm.Trajectory())
 
-phase0 = traj.add_phase('phase0',
-    dm.Phase(ode_class=VehicleODE,
-             transcription=dm.Radau(num_segments=10)))
 
+if optimizer == 'IPOPT':
+    phase0 = traj.add_phase('phase0',
+        dm.Phase(ode_class=VehicleODE,
+                 transcription=dm.Radau(num_segments=10)))
+else:
+    phase0 = traj.add_phase('phase0',
+        dm.Phase(ode_class=VehicleODE,
+                 transcription=dm.Radau(num_segments=15, order=3)))
 # Add the phase to the model
 p.model.linear_solver = om.DirectSolver()
 p.model.nonlinear_solver = om.NewtonSolver(solve_subsystems=True)
@@ -496,7 +501,7 @@ phase0.add_state('theta', fix_initial=True, fix_final=True, units='rad', rate_so
 phase0.add_state('phi', fix_initial=True, fix_final=True, units='rad', rate_source='phidot',
                  lower=-np.radians(3), upper=np.radians(3))
 phase0.add_state('v', fix_initial=True, fix_final=False, units='m/s', rate_source='vdot',
-                 lower=0, ref=2000)
+                 lower=0, ref=3000)
 # Changed from free to fixed final
 phase0.add_state('gamma', fix_initial=True, fix_final=True, units='rad', rate_source='gammadot',
                  lower=-np.radians(89), upper=np.radians(89))
@@ -514,9 +519,9 @@ phase0.add_control('alpha', units='rad', opt=True,
 phase0.add_timeseries_output('dist_to_debris', shape=(1,))
 
 # Objective 1: maximize final theta (longitude) downrange distance
-#phase0.add_objective('phi', loc='final', ref=-0.01)
+phase0.add_objective('phi', loc='final', ref=-0.01)
 # Objective 2: maximize final velocity
-phase0.add_objective('v', loc='final', ref=-1.0)
+#phase0.add_objective('v', loc='final', ref=-1.0)
 # Objective 3: minimize time
 #phase0.add_objective('t', loc='final', ref=1.0)
 
@@ -529,10 +534,10 @@ phase0.set_time_val(initial=0.0, duration=2000, units='s')
 # Boundary conditions from Vedantam & Grant Table 2
 phase0.set_state_val('h', [40000.0, 0.0], units='m')
 phase0.set_state_val('theta', [0.0, np.radians(3.5)], units='rad')
-phase0.set_state_val('phi', [0.0, np.radians(0.1)], units='rad')
-phase0.set_state_val('v', [2000.0, 1100.0], units='m/s')  # final free but initialized
+phase0.set_state_val('phi', [0.0, np.radians(2.1)], units='rad')
+phase0.set_state_val('v', [3000.0, 1100.0], units='m/s')  # final free but initialized
 phase0.set_state_val('gamma', [0.0, -np.radians(45)], units='rad')
-phase0.set_state_val('psi', [0.0, np.radians(0)], units='rad')
+phase0.set_state_val('psi', [np.radians(0), np.radians(90+45)], units='rad')
 
 # Bank angle control guess (sigma)
 phase0.set_control_val('sigma', [np.radians(0.0), np.radians(0.0)])
@@ -550,9 +555,9 @@ plot_results([
     ('traj.phase0.timeseries.time', 'traj.phase0.timeseries.sigma',
      'Time (s)', 'Bank Angle σ (rad)'),
     ('traj.phase0.timeseries.time', 'traj.phase0.timeseries.alpha',
-     'Time (s)', 'Angle of Attack α (rad)'),
-    ('traj.phase0.timeseries.time', 'traj.phase0.timeseries.dist_to_debris',
-               'time (s)', 'Distance (m)')
+     'Time (s)', 'Angle of Attack α (rad)')
+#    ('traj.phase0.timeseries.time', 'traj.phase0.timeseries.dist_to_debris',
+#               'time (s)', 'Distance (m)')
 ], title='Vedantam-Grant Controls', p_sol=sol, p_sim=sim)
 plt.tight_layout()
 
@@ -570,8 +575,8 @@ plot_results([
     ('traj.phase0.timeseries.time', 'traj.phase0.timeseries.gamma',
      'Time (s)', 'Flight Path Angle γ (rad)'),
 
-    ('traj.phase0.timeseries.time', 'traj.phase0.timeseries.phi',
-     'Time (s)', 'Latitude φ (rad)'),
+#    ('traj.phase0.timeseries.time', 'traj.phase0.timeseries.phi',
+#     'Time (s)', 'Latitude φ (rad)'),
 
     ('traj.phase0.timeseries.time', 'traj.phase0.timeseries.psi',
      'Time (s)', 'Heading Angle ψ (rad)')
@@ -611,9 +616,9 @@ plt.xlabel('Downrange (deg)')
 plt.ylabel('Crossrange (deg)')
 plt.plot(sol.get_val('traj.phase0.timeseries.theta'),
          sol.get_val('traj.phase0.timeseries.phi'))
-plt.scatter(np.degrees(theta0), np.degrees(phi0), c='r', label='Debris Field Center')
-CirclePlot(center_x=np.degrees(theta0), center_y=np.degrees(phi0), radius_m=debris_radius,
-           view='topdown', color='red', linestyle='--', label='Debris Radius')
+#plt.scatter(np.degrees(theta0), np.degrees(phi0), c='r', label='Debris Field Center')
+#CirclePlot(center_x=np.degrees(theta0), center_y=np.degrees(phi0), radius_m=debris_radius,
+#           view='topdown', color='red', linestyle='--', label='Debris Radius')
 plt.title('Vehicle Ground Track (Crossrange vs Downrange)')
 plt.grid(True)
 plt.legend()
@@ -644,9 +649,9 @@ altitude_sim = sim.get_val('traj.phase0.timeseries.h')  # in meters
 plt.figure(figsize=(8,6))
 plt.plot(downrange_sol, altitude_sol, 'o', label='solution')   
 plt.plot(downrange_sim, altitude_sim, '-', label='simulation') 
-plt.scatter(np.degrees(theta0), h0, c='r', label='Debris Center')
-CirclePlot(center_x=np.degrees(theta0), center_y=h0, radius_m=debris_radius,
-           view='lateral', color='red', linestyle='--', label='Debris Radius')
+#plt.scatter(np.degrees(theta0), h0, c='r', label='Debris Center')
+#CirclePlot(center_x=np.degrees(theta0), center_y=h0, radius_m=debris_radius,
+#           view='lateral', color='red', linestyle='--', label='Debris Radius')
 plt.xlabel('Downrange (deg)')
 plt.ylabel('Altitude (m)')
 plt.title('Altitude vs. Downrange')
@@ -654,9 +659,13 @@ plt.grid(True)
 plt.tight_layout()
 
 # Create 3D plot of trajectory
-x = theta_sim
-y = phi_sim
+x = np.degrees(theta_sim)
+y = np.degrees(phi_sim)
 z = altitude_sim
+
+x = np.array(x).flatten()
+y = np.array(y).flatten()
+z = np.array(z).flatten()
 
 fig = go.Figure(data=[go.Scatter3d(
     x=x,
@@ -672,6 +681,10 @@ fig.update_layout(
         xaxis_title='X',
         yaxis_title='Y',
         zaxis_title='Z',
+        xaxis=dict(title='Downrange (deg)', range=[min(x), max(x)]),
+        yaxis=dict(title='Crossrange (deg)', range=[min(x), max(x)]),
+        aspectmode='manual',
+        aspectratio=dict(x=1, y=1, z=0.5)  #x and y same scale
     ),
     title="3D Trajectory of Hypersonic Vehicle",
     margin=dict(l=0, r=0, b=0, t=40)
