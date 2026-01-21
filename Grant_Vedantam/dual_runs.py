@@ -8,6 +8,7 @@ from dymos.examples.plotting import plot_results
 from openmdao.utils.general_utils import set_pyoptsparse_opt
 import plotly.graph_objects as go
 import plotly.io as pio
+import time
 
 
 # Define Center of Debris Field
@@ -172,8 +173,8 @@ class DebrisDistance(om.ExplicitComponent):
 class LoSDistance(om.ExplicitComponent):
     """
     For each node i in Traj B, compute the minimum 3D distance between the
-    line-of-sight line from P_B(i) to P_T (target) and all sampled points Q_j of
-    Traj A. Outputs the minimum distance at each node.
+    line-of-sight line from P_B(i) to P_T (target) and nearby sampled
+    points Q_j of Traj A.
 
     Inputs:
       theta  [rad], phi [rad], h [m]   (B trajectory states)
@@ -189,26 +190,22 @@ class LoSDistance(om.ExplicitComponent):
       target_theta : float [rad]
       target_phi   : float [rad]
       target_h     : float [m]
-
-    Notes:
-      - Uses a point-cloud min distance to the *infinite* line; this is a very
-        good approximation if Traj A is sampled densely. If you need segment-
-        wise (polyline) orthogonal distances, you can extend this to per-
-        segment projections, but this version is efficient and robust.
-      - Derivatives are declared via finite-difference (or CS) for simplicity.
+      window : int  (half-width in A indices to search around mapped index)
     """
     def initialize(self):
         self.options.declare('num_nodes', types=int)
         self.options.declare('earth_radius', default=6_371_000.0)
         self.options.declare('theta_A', types=np.ndarray)
-        self.options.declare('phi_A', types=np.ndarray)
-        self.options.declare('h_A', types=np.ndarray)
+        self.options.declare('phi_A',   types=np.ndarray)
+        self.options.declare('h_A',     types=np.ndarray)
         self.options.declare('target_theta', types=float)
-        self.options.declare('target_phi', types=float)
-        self.options.declare('target_h', types=float)
+        self.options.declare('target_phi',   types=float)
+        self.options.declare('target_h',     types=float)
+        self.options.declare('window', default=10, types=int)   # +/- 10 indices
 
     def setup(self):
         nn = self.options['num_nodes']
+
         self.add_input('theta', val=np.zeros(nn), units='rad')
         self.add_input('phi',   val=np.zeros(nn), units='rad')
         self.add_input('h',     val=np.zeros(nn), units='m')
@@ -216,63 +213,89 @@ class LoSDistance(om.ExplicitComponent):
         self.add_output('los_min_dist', val=np.zeros(nn), units='m')
 
         ar = np.arange(nn, dtype=int)
-        # Use finite-difference (or change to method='cs' if your model supports it)
+        # FD is fine; change to 'cs' if your model supports complex step
         self.declare_partials('los_min_dist', 'theta', rows=ar, cols=ar, method='fd')
         self.declare_partials('los_min_dist', 'phi',   rows=ar, cols=ar, method='fd')
         self.declare_partials('los_min_dist', 'h',     rows=ar, cols=ar, method='fd')
 
-        # Precompute Traj A point cloud (Cartesian) and target point (Cartesian)
+        # Precompute Traj A Cartesian points
         Re = self.options['earth_radius']
         theta_A = self.options['theta_A'].reshape(-1)
         phi_A   = self.options['phi_A'].reshape(-1)
         h_A     = self.options['h_A'].reshape(-1)
-        rA = Re + h_A
+
+        rA   = Re + h_A
         cphi = np.cos(phi_A); sphi = np.sin(phi_A)
         cth  = np.cos(theta_A); sth = np.sin(theta_A)
-        self._QA = np.vstack((rA*cphi*cth, rA*cphi*sth, rA*sphi)).T  # shape (NA,3)
+        self._QA = np.vstack((rA*cphi*cth, rA*cphi*sth, rA*sphi)).T  # (N_A, 3)
+        self._NA = self._QA.shape[0]
+
+        # Index mapping factor if N_A != N_B (maps B index -> A index)
+        self._NB = nn
+        if nn > 1:
+            self._index_scale = (self._NA - 1) / (nn - 1)
+        else:
+            self._index_scale = 0.0
 
         # Target Cartesian
         thT = self.options['target_theta']
         phT = self.options['target_phi']
         hT  = self.options['target_h']
-        rT = Re + hT
+        rT  = Re + hT
         self._PT = np.array([rT*np.cos(phT)*np.cos(thT),
                              rT*np.cos(phT)*np.sin(thT),
                              rT*np.sin(phT)])
 
+
     def compute(self, inputs, outputs):
-        nn = self.options['num_nodes']
-        Re = self.options['earth_radius']
-
-        theta = inputs['theta'].reshape(-1)
-        phi   = inputs['phi'].reshape(-1)
-        h     = inputs['h'].reshape(-1)
-
-        rB = Re + h
-        cphi = np.cos(phi); sphi = np.sin(phi)
-        cth  = np.cos(theta); sth = np.sin(theta)
-
-        PB = np.vstack((rB*cphi*cth, rB*cphi*sth, rB*sphi)).T  # (nn,3)
-        PT = self._PT[None, :]                                 # (1,3)
-        d  = PT - PB                                           # (nn,3)
-        d_norm = np.linalg.norm(d, axis=1)                     # (nn,)
-
-        # For each node i, compute min over j: || (Q_j - PBi) x d_i || / ||d_i||
-        # Vectorized: for each i, broadcast Q_j - PBi over j
-        los_min = np.empty(nn)
-        QA = self._QA  # (NA,3)
-
+        theta = inputs['theta']
+        phi   = inputs['phi']
+        h     = inputs['h']
+    
+        nn = len(theta)
+        los_dist = outputs['los_min_dist']
+        QA = self._QA
+        PT = self._PT
+    
+        halfwin = 2  # your window half-width
+    
         for i in range(nn):
-            denom = d_norm[i]
-            if denom <= 0.0:
-                los_min[i] = 0.0
+    
+            # Skip first and last 20 nodes
+            if i < 0 or i >= nn - 20:
+                los_dist[i] = 5e1  # or even np.nan, but IPOPT dislikes NaNs
                 continue
-            diff = QA - PB[i]                 # (NA,3)
-            cross = np.cross(diff, d[i])      # (NA,3)
-            num = np.linalg.norm(cross, axis=1)  # (NA,)
-            los_min[i] = np.min(num / denom)
-
-        outputs['los_min_dist'] = los_min
+    
+            # Convert B node to Cartesian
+            Re = self.options['earth_radius']
+            rB = Re + h[i]
+            cphi = np.cos(phi[i])
+            sphi = np.sin(phi[i])
+            cth = np.cos(theta[i])
+            sth = np.sin(theta[i])
+            PB = np.array([rB*cphi*cth, rB*cphi*sth, rB*sphi])
+    
+            # Direction of line to target
+            d = PT - PB
+            L = np.linalg.norm(d)
+            if L < 1e-9:
+                los_dist[i] = 0.0
+                continue
+            d = d / L
+    
+            # Window of A indices
+            j1 = max(0, i - halfwin)
+            j2 = min(QA.shape[0], i + halfwin + 1)
+            QA_sub = QA[j1:j2]
+    
+            # Vector differences
+            v = QA_sub - PB
+            t = np.clip(np.einsum('ij,j->i', v, d), 0.0, L)
+            proj = PB + np.outer(t, d)
+            diff = QA_sub - proj
+            dist2 = np.sum(diff*diff, axis=1)
+    
+            los_dist[i] = np.sqrt(np.min(dist2))
 
 
 class FlightDynamics(om.ExplicitComponent):
@@ -509,6 +532,7 @@ class VehicleODE(Group):
                 promotes_outputs=['los_min_dist']           # scalar per node
             )
 
+
         # Dynamics model: 6-DOF planar dynamics using Vedantam/Grant equations
         self.add_subsystem('eom',
                            subsys=FlightDynamics(num_nodes=nn),
@@ -589,9 +613,7 @@ def solve_vehicle(initial_phi, final_theta, final_phi, final_gamma, final_psi,
     out : dict
         { 'label': str, 'theta': deg, 'phi': deg, 'h': m, 'time': s, 'sol': Case, 'sim': Case }
     """
-    import openmdao.api as om
-    import dymos as dm
-    from openmdao.utils.general_utils import set_pyoptsparse_opt
+    t0 = time.time()
 
     #Build the problem
     p = om.Problem(model=om.Group())
@@ -642,17 +664,22 @@ def solve_vehicle(initial_phi, final_theta, final_phi, final_gamma, final_psi,
 
     phase0.add_state('h',     fix_initial=True, fix_final=True,  units='m',  rate_source='hdot',     lower=0, ref=40000, defect_ref=4.0e4)
     phase0.add_state('theta', fix_initial=True, fix_final=True,  units='rad', rate_source='thetadot', lower=0, upper=np.radians(6), defect_ref=np.radians(0.5))
-    phase0.add_state('phi',   fix_initial=True, fix_final=True,  units='rad', rate_source='phidot',   lower=-np.radians(0), upper=np.radians(3), defect_ref=np.radians(0.5))
+    phase0.add_state('phi',   fix_initial=True, fix_final=True,  units='rad', rate_source='phidot',   lower=-np.radians(0), upper=np.radians(6), defect_ref=np.radians(0.5))
     phase0.add_state('v',     fix_initial=True, fix_final=False, units='m/s', rate_source='vdot',     lower=0, ref=2000, defect_ref=2000)
     phase0.add_state('gamma', fix_initial=True, fix_final=False,  units='rad', rate_source='gammadot', lower=-np.radians(89), upper=np.radians(89), defect_ref=np.radians(5))
     phase0.add_state('psi',   fix_initial=True, fix_final=False,  units='rad', rate_source='psidot',   lower=-np.radians(0), upper=np.radians(90), defect_ref=np.radians(10))
     phase0.add_control('sigma', units='rad', opt=True, lower=np.radians(-1), upper=np.radians(165), rate_continuity=True)
     phase0.add_control('alpha', units='rad', opt=True, lower=np.radians(0), upper=np.radians(40), rate_continuity=True)
 
-    # Keep debris distance in timeseries
-    phase0.add_timeseries_output('dist_to_debris', shape=(1,))
     if los_opts is not None:
         phase0.add_timeseries_output('los_min_dist', shape=(1,))
+        phase0.add_path_constraint(
+        'los_min_dist',
+        lower=20.0,
+        units='m',
+        ref=50.0,        # scaling for the constraint (tune as needed)
+    )
+
 
     # Objective Function
     phase0.add_objective('time', loc='final', ref=0.1)
@@ -675,6 +702,9 @@ def solve_vehicle(initial_phi, final_theta, final_phi, final_gamma, final_psi,
 
     # --- Solve and simulate ---
     dm.run_problem(p, simulate=True)
+    t1 = time.time()
+
+    print(f"[{label}] Optimization time: {t1 - t0:.2f} s")
 
     sol = om.CaseReader(p.get_outputs_dir() / 'dymos_solution.db').get_case('final')
     sim = om.CaseReader(traj.sim_prob.get_outputs_dir() / 'dymos_simulation.db').get_case('final')
@@ -704,7 +734,7 @@ def ts(case, var):
 
 # Define two terminal-condition variants
 case_A = solve_vehicle(initial_phi = np.radians(0.0),
-                        final_theta=np.radians(3.5),
+                        final_theta=np.radians(1.5),
                        final_phi=np.radians(2.0),
                        final_gamma=-np.radians(45),
                        final_psi=np.radians(85),
@@ -723,12 +753,13 @@ los_opts = dict(
     h_A=h_A,
     target_theta=np.radians(3.5),
     target_phi=np.radians(2.1),
-    target_h=0.0
+    target_h=0.0,
+    window=1
 )
 
 earth_radius=6_371_000.0
-case_B = solve_vehicle(initial_phi = 12.0/earth_radius,
-                        final_theta=np.radians(3.5),
+case_B = solve_vehicle(initial_phi = 30.0/earth_radius,
+                        final_theta=np.radians(1.5),
                        final_phi=np.radians(2.0),
                        final_gamma=-np.radians(45),
                        final_psi=np.radians(85),
