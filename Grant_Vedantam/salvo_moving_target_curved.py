@@ -296,6 +296,101 @@ class FlightDynamics(om.ExplicitComponent):
         J['psidot', 'phi'] = -v * cos_gamma * cos_psi * sec_phi_sq / r
         J['psidot', 'h'] = v * cos_gamma * cos_psi * tan_phi / r**2
 
+
+class TargetMotionCurved(om.ExplicitComponent):
+    """
+    Curved target kinematics: constant-speed, constant-turn-rate motion in the local
+    tangent plane, mapped to (theta_T, phi_T) rates on a spherical Earth.
+
+    - Heading evolves as: psi_T(t) = psi_T0 + omega * t, omega = V / R_turn.
+    - Horizontal speed magnitude is constant: V (m/s).
+    - Motion is expressed in local North/East components:
+        vN = V * cos(psi_T)
+        vE = -V * sin(psi_T)   (negative gives a left turn from North toward West when omega>0)
+    - Latitude/longitude rates:
+        phi_dot   = vN / (Re + h_T)
+        theta_dot = vE / ((Re + h_T) * cos(phi_T))
+
+    Bounded motion:
+      If t > t_stop, the target stops moving (rates go to 0), which provides an
+      upper bound on how far the target can travel.
+
+    Altitude:
+      Linearly increases from h0 to h0 + h_climb_total over [0, t_stop] and then holds.
+      h_dot = h_climb_total / t_stop for t <= t_stop else 0.
+    """
+
+    def initialize(self):
+        self.options.declare('num_nodes', types=int)
+        self.options.declare('earth_radius', default=6_371_000.0)
+
+    def setup(self):
+        nn = self.options['num_nodes']
+
+        # Dymos supplies phase time if the ODE has an input named 'time'
+        self.add_input('time', val=np.zeros(nn), units='s')
+
+        # Current target latitude and altitude (states)
+        self.add_input('phi_T', val=np.zeros(nn), units='rad')
+        self.add_input('h_T',   val=np.zeros(nn), units='m')
+
+        # Parameters (constants over the phase; provided via Dymos parameters)
+        self.add_input('target_speed', val=np.ones(nn)*100.0, units='m/s')
+        self.add_input('turn_radius',  val=np.ones(nn)*20_000.0, units='m')
+        self.add_input('psi_T0',       val=np.zeros(nn), units='rad')
+        self.add_input('t_stop',       val=np.ones(nn)*250.0, units='s')
+        self.add_input('h_climb_total', val=np.ones(nn)*1000.0, units='m')
+
+        # Outputs: target state rates
+        self.add_output('theta_T_dot', val=np.zeros(nn), units='rad/s')
+        self.add_output('phi_T_dot',   val=np.zeros(nn), units='rad/s')
+        self.add_output('h_T_dot',     val=np.zeros(nn), units='m/s')
+
+        # Helpful for plotting/debugging (optional)
+        self.add_output('psi_T', val=np.zeros(nn), units='rad')
+
+        # Derivatives: FD is fine for now
+        self.declare_partials('*', '*', method='fd')
+
+    def compute(self, inputs, outputs):
+        Re = self.options['earth_radius']
+
+        t = inputs['time'].reshape(-1)
+        phi = inputs['phi_T'].reshape(-1)
+        h   = inputs['h_T'].reshape(-1)
+
+        V   = inputs['target_speed'].reshape(-1)
+        R   = inputs['turn_radius'].reshape(-1)
+        psi0 = inputs['psi_T0'].reshape(-1)
+        tstop = inputs['t_stop'].reshape(-1)
+        htot = inputs['h_climb_total'].reshape(-1)
+
+        # Effective time for bounded motion/climb
+        teff = np.minimum(t, tstop)
+
+        omega = V / R  # rad/s
+        psi = psi0 + omega * teff
+
+        # Local velocities (North/East). Choose sign so omega>0 turns from North toward West.
+        vN = V * np.cos(psi)
+        vE = -V * np.sin(psi)
+
+        # Stop motion after t_stop (upper bound on target travel)
+        moving = (t <= tstop).astype(float)
+        vN = vN * moving
+        vE = vE * moving
+
+        r = Re + h
+        outputs['phi_T_dot'] = vN / r
+        outputs['theta_T_dot'] = vE / (r * np.cos(phi) + 1e-12)
+
+        # Linear climb over [0, t_stop], then hold
+        # If t_stop is (near) zero, avoid divide-by-zero
+        hdot = np.where(tstop > 1e-9, htot / tstop, 0.0)
+        outputs['h_T_dot'] = hdot * moving
+
+        outputs['psi_T'] = psi
+
 class VehicleODE(Group):
     """
     The ODE for the Shuttle reentry problem following Vedantam & Grant (2022).
@@ -331,16 +426,90 @@ class VehicleODE(Group):
                                'gammadot', 'psidot'
                            ])
 
-def solve_vehicle(initial_phi, initial_psi, final_theta, final_phi, final_gamma, final_psi, 
-                  t_duration=250.0, label="Case"):
+        # Target motion model (for moving terminal target)
+        self.add_subsystem('target_motion',
+                           subsys=TargetMotionCurved(num_nodes=nn, earth_radius=6_371_000.0),
+                           promotes_inputs=['time', 'phi_T', 'h_T', 'target_speed', 'turn_radius', 'psi_T0', 't_stop', 'h_climb_total'],
+                           promotes_outputs=['theta_T_dot', 'phi_T_dot', 'h_T_dot', 'psi_T'])
+        
+        # Terminal error signals for boundary constraints: vehicle - target
+        self.add_subsystem('target_err',
+                           om.ExecComp(['theta_err = theta - theta_T',
+                                        'phi_err   = phi   - phi_T',
+                                        'h_err     = h     - h_T'],
+                                       theta=np.zeros(nn), theta_T=np.zeros(nn),
+                                       phi=np.zeros(nn),   phi_T=np.zeros(nn),
+                                       h=np.zeros(nn),     h_T=np.zeros(nn),
+                                       theta_err=np.zeros(nn), phi_err=np.zeros(nn), h_err=np.zeros(nn)),
+                           promotes_inputs=['theta', 'theta_T', 'phi', 'phi_T', 'h', 'h_T'],
+                           promotes_outputs=['theta_err', 'phi_err', 'h_err'])
+
+def target_state_at_time(target, t, earth_radius=6_371_000.0):
+    """Compute an approximate target (theta, phi, h) at time t (seconds) for initial guesses/plotting.
+
+    Uses the same curved-motion model as TargetMotionCurved, but integrated analytically in a local
+    North/East tangent plane, then mapped to small-angle changes in latitude/longitude.
+
+    target dict keys (all SI/rad):
+      theta0, phi0, h0
+      speed_mps, turn_radius_m, psi0
+      t_stop, h_climb_total_m
+    """
+    th0 = float(target['theta0'])
+    ph0 = float(target['phi0'])
+    h0  = float(target['h0'])
+    V   = float(target['speed_mps'])
+    R   = float(target['turn_radius_m'])
+    psi0 = float(target['psi0'])
+    tstop = float(target['t_stop'])
+    htot  = float(target['h_climb_total_m'])
+
+    teff = min(float(t), tstop)
+
+    # Heading over time
+    omega = V / R if R > 1e-9 else 0.0
+    ang = omega * teff
+
+    # Integrate local NE displacement for constant-speed, constant-turn-rate motion
+    # Starting heading psi0, turning left (toward West) with vE = -V*sin(psi).
+    # For psi(t) = psi0 + omega t:
+    #   N(t) = (V/omega)[sin(psi0+omega t) - sin(psi0)]
+    #   E(t) = (V/omega)[cos(psi0+omega t) - cos(psi0)] * (-1)?? handled by vE definition below
+    if abs(omega) < 1e-12:
+        # Straight line
+        N = V * teff * np.cos(psi0)
+        E = -V * teff * np.sin(psi0)
+    else:
+        psi1 = psi0 + ang
+        N = (V/omega) * (np.sin(psi1) - np.sin(psi0))
+        # With vE = -V*sin(psi), integral gives:
+        E = (V/omega) * (np.cos(psi1) - np.cos(psi0))
+
+    # Map to lat/long increments (small-angle approx)
+    r = earth_radius + h0
+    dphi = N / r
+    dtheta = E / (r * np.cos(ph0) + 1e-12)
+
+    # Altitude linear climb over [0, t_stop]
+    if tstop > 1e-9:
+        h = h0 + htot * (teff / tstop)
+    else:
+        h = h0
+
+    return th0 + dtheta, ph0 + dphi, h
+
+def solve_vehicle(initial_phi, initial_psi, final_gamma, final_psi,
+                  target, t_duration=250.0, label="Case"):
     """
     Build, solve, and simulate one vehicle trajectory, returning arrays needed for plotting.
     Only final boundary values differ between cases; initial conditions are shared.
 
     Parameters
     ----------
-    final_theta, final_phi : float (rad)
-        Desired terminal longitude/latitude.
+    target : dict
+        Target definition with keys:
+          'theta0', 'phi0', 'h0' (initial location, rad/rad/m)
+          'speed_mps', 'turn_radius_m', 'psi0', 't_stop', 'h_climb_total_m' (curved motion params)
     final_gamma, final_psi : float (rad)
         Desired terminal flight-path angle and heading.
     t_duration : float (s)
@@ -402,11 +571,32 @@ def solve_vehicle(initial_phi, initial_psi, final_theta, final_phi, final_gamma,
 
     # Time/state/control defs
     phase0.set_time_options(fix_initial=True, fix_duration=False, units='s',
-                        duration_ref=250.0, duration_bounds=(197.802, 500.0))
+                        duration_ref=150.0, duration_bounds=(100.0, 500.0))
 
-    phase0.add_state('h',     fix_initial=True, fix_final=True,  units='m',  rate_source='hdot',     lower=0, ref=40000, defect_ref=4.0e4)
-    phase0.add_state('theta', fix_initial=True, fix_final=True,  units='rad', rate_source='thetadot', lower=0, upper=np.radians(6), defect_ref=np.radians(0.5))
-    phase0.add_state('phi',   fix_initial=True, fix_final=True,  units='rad', rate_source='phidot',   lower=-np.radians(5), upper=np.radians(5), defect_ref=np.radians(0.5))
+    phase0.add_state('h',     fix_initial=True, fix_final=False,  units='m',  rate_source='hdot',     lower=0, ref=40000, defect_ref=4.0e4)
+    phase0.add_state('theta', fix_initial=True, fix_final=False,  units='rad', rate_source='thetadot', lower=0, upper=np.radians(6), defect_ref=np.radians(0.5))
+    phase0.add_state('phi',   fix_initial=True, fix_final=False,  units='rad', rate_source='phidot',   lower=-np.radians(5), upper=np.radians(5), defect_ref=np.radians(0.5))
+
+    # --- Moving target states (Method A): evolve target inside the phase ---
+    phase0.add_state('theta_T', fix_initial=True, fix_final=False, units='rad', rate_source='theta_T_dot',
+                 lower=-np.radians(180), upper=np.radians(180), defect_ref=np.radians(0.5))
+    phase0.add_state('phi_T',   fix_initial=True, fix_final=False, units='rad', rate_source='phi_T_dot',
+                 lower=-np.radians(90), upper=np.radians(90), defect_ref=np.radians(0.5))
+    phase0.add_state('h_T',     fix_initial=True, fix_final=False, units='m',   rate_source='h_T_dot',
+                 lower=-1.0e3, upper=2.0e5, defect_ref=4.0e4)
+    # Curved target motion parameters (promoted into the ODE)
+    phase0.add_parameter('target_speed', opt=False, val=target['speed_mps'], units='m/s')
+    phase0.add_parameter('turn_radius',  opt=False, val=target['turn_radius_m'], units='m')
+    phase0.add_parameter('psi_T0',       opt=False, val=target['psi0'], units='rad')
+    phase0.add_parameter('t_stop',       opt=False, val=target['t_stop'], units='s')
+    phase0.add_parameter('h_climb_total', opt=False, val=target['h_climb_total_m'], units='m')
+
+
+    # Enforce vehicle hits the moving target at final time (vehicle - target = 0 at tf)
+    phase0.add_boundary_constraint('theta_err', loc='final', equals=0.0, units='rad')
+    phase0.add_boundary_constraint('phi_err',   loc='final', equals=0.0, units='rad')
+    phase0.add_boundary_constraint('h_err',     loc='final', equals=0.0, units='m')
+
     phase0.add_state('v',     fix_initial=True, fix_final=False, units='m/s', rate_source='vdot',     lower=0, ref=2000, defect_ref=2000)
     phase0.add_state('gamma', fix_initial=True, fix_final=False,  units='rad', rate_source='gammadot', lower=-np.radians(89), upper=np.radians(89), defect_ref=np.radians(1))
     phase0.add_state('psi',   fix_initial=True, fix_final=False,  units='rad', rate_source='psidot',   lower=-np.radians(90), upper=np.radians(90), defect_ref=np.radians(1))
@@ -420,13 +610,23 @@ def solve_vehicle(initial_phi, initial_psi, final_theta, final_phi, final_gamma,
 
     # Initial and terminal boundary values (share initial, vary final)
     phase0.set_time_val(initial=0.0, duration=t_duration, units='s')
-    # Initials
-    phase0.set_state_val('h',     [40000.0, 0.0],           units='m')
-    phase0.set_state_val('theta', [0.0,     final_theta],   units='rad')
-    phase0.set_state_val('phi',   [initial_phi,     final_phi],     units='rad')
-    phase0.set_state_val('v',     [2000.0,  800.0],        units='m/s')   # final free but initialized
-    phase0.set_state_val('gamma', [0.0,     final_gamma],   units='rad')
+    # Initial guesses (vehicle and target)
+    # We build consistent end guesses for the moving target from the same curved-motion model.
+    thetaT_end, phiT_end, hT_end = target_state_at_time(target, t_duration, earth_radius=6_371_000.0)
+    
+    # Vehicle state initial guesses (same structure as before; final values are just guesses)
+    phase0.set_state_val('h',     [40000.0, 0.0], units='m')
+    phase0.set_state_val('theta', [0.0, thetaT_end], units='rad')
+    phase0.set_state_val('phi',   [initial_phi, phiT_end], units='rad')
+    phase0.set_state_val('v',     [2000.0,  800.0], units='m/s')   # final free but initialized
+    phase0.set_state_val('gamma', [0.0,     final_gamma], units='rad')
     phase0.set_state_val('psi',   [initial_psi, final_psi], units='rad')
+    
+    # Target initial condition at t=0 and a consistent end guess at t=t_duration.
+    phase0.set_state_val('theta_T', [target['theta0'], thetaT_end], units='rad')
+    phase0.set_state_val('phi_T',   [target['phi0'],   phiT_end],   units='rad')
+    phase0.set_state_val('h_T',     [target['h0'],     hT_end],     units='m')
+
 
     # Control initial guesses
     phase0.set_control_val('sigma', [np.radians(0.0), np.radians(0.0)])
@@ -470,40 +670,59 @@ def ts(case, var):
     y = sim.get_val(f'traj.phase0.timeseries.{var}').ravel()
     return t, y
 
-# Define two terminal-condition variants
-case_A = solve_vehicle(initial_phi = np.radians(2.0),
-                       initial_psi = -np.radians(75.0),
-                       final_theta=np.radians(1.5),
-                       final_phi=np.radians(1.0),
-                       final_gamma=-np.radians(45),
-                       final_psi=np.radians(85),
-                       label="Vehicle A")
 
-# Record the A trajectory
-A_sim = case_A['sim']
-theta_A = A_sim.get_val('traj.phase0.timeseries.theta').ravel()
-phi_A   = A_sim.get_val('traj.phase0.timeseries.phi').ravel()
-h_A     = A_sim.get_val('traj.phase0.timeseries.h').ravel()
+# === Shared moving target definition (used by both Vehicle A and B) ===
+EARTH_RADIUS_M = 6_371_000.0
 
-earth_radius=6_371_000.0
-case_B = solve_vehicle(initial_phi = 0.0/earth_radius,
-                       initial_psi = np.radians(75.0),
-                       final_theta=np.radians(1.5),
-                       final_phi=np.radians(1.0),
+# Initial target location (radians, meters)
+TARGET_THETA0 = np.radians(1.5)   # initial downrange (theta) [rad]
+TARGET_PHI0   = np.radians(1.0)   # initial crossrange (phi) [rad]
+TARGET_H0     = 0.0               # initial altitude [m]
+
+# Curved target motion parameters
+TARGET_SPEED_MPS      = 60.0       # constant horizontal speed [m/s]
+TARGET_TURN_RADIUS_M  = 20_000.0    # constant turn radius [m]
+TARGET_PSI0_RAD       = 5.0         # initial heading [rad]; 0 = north, turning left moves toward west
+TARGET_TSTOP_S        = 400.0       # upper bound on how long the target moves [s] (then it stops)
+TARGET_CLIMB_TOTAL_M  = 1000.0      # altitude climbs linearly by this amount over [0, t_stop]
+
+TARGET = dict(theta0=TARGET_THETA0,
+              phi0=TARGET_PHI0,
+              h0=TARGET_H0,
+              speed_mps=TARGET_SPEED_MPS,
+              turn_radius_m=TARGET_TURN_RADIUS_M,
+              psi0=TARGET_PSI0_RAD,
+              t_stop=TARGET_TSTOP_S,
+              h_climb_total_m=TARGET_CLIMB_TOTAL_M)
+
+# Define two terminal-condition variants (same target for both)
+case_A = solve_vehicle(initial_phi=np.radians(2.0),
+                       initial_psi=-np.radians(10.0),
                        final_gamma=-np.radians(45),
                        final_psi=-np.radians(85),
+                       target=TARGET,
+                       label="Vehicle A")
+
+case_B = solve_vehicle(initial_phi=np.radians(0.0),
+                       initial_psi=np.radians(10.0),
+                       final_gamma=-np.radians(45),
+                       final_psi=np.radians(45),
+                       target=TARGET,
                        label="Vehicle B")
 
-B_sim = case_B['sim']
-tB    = B_sim.get_val('traj.phase0.timeseries.time').ravel()
+# --- Target trajectory from the simulation timeseries (same for both cases) ---
+T_sim = case_A['sim']
+tT = T_sim.get_val('traj.phase0.timeseries.time').ravel()
+thetaT_deg = np.degrees(T_sim.get_val('traj.phase0.timeseries.theta_T')).ravel()
+phiT_deg   = np.degrees(T_sim.get_val('traj.phase0.timeseries.phi_T')).ravel()
+hT_m       = T_sim.get_val('traj.phase0.timeseries.h_T').ravel()
 
+# Helpers to grab control histories
 tA, alphaA = ts(case_A, 'alpha')
 tB, alphaB = ts(case_B, 'alpha')
-
 tA_s, sigmaA = ts(case_A, 'sigma')
 tB_s, sigmaB = ts(case_B, 'sigma')
 
-# Convert to degrees
 alphaA_deg = np.degrees(alphaA)
 alphaB_deg = np.degrees(alphaB)
 sigmaA_deg = np.degrees(sigmaA)
@@ -513,7 +732,6 @@ print("\n=== Impact Times ===")
 print(f"Vehicle A impact time: {case_A['t_final']:.3f} s")
 print(f"Vehicle B impact time: {case_B['t_final']:.3f} s")
 print(f"Δt (B - A): {case_B['t_final'] - case_A['t_final']:.6f} s")
-
 
 # Plot α vs time
 plt.figure(figsize=(8,5))
@@ -537,24 +755,32 @@ plt.grid(True)
 plt.legend()
 plt.tight_layout()
 
-# Plot Top Down View
+# Plot Top Down View (include the moving target path + start/end markers)
 plt.figure(figsize=(8,6))
-plt.plot(case_A['theta'], case_A['phi'], '-',  label=case_A['label'])
-plt.plot(case_B['theta'], case_B['phi'], '-',  label=case_B['label'])
+plt.plot(case_A['theta'], case_A['phi'], '-', label=case_A['label'])
+plt.plot(case_B['theta'], case_B['phi'], '-', label=case_B['label'])
+plt.plot(thetaT_deg, phiT_deg, '--', label='Target path')
+plt.plot(thetaT_deg[0],  phiT_deg[0],  'o', label='Target start')
+plt.plot(thetaT_deg[-1], phiT_deg[-1], 'x', label='Target end')
 plt.xlabel('Downrange (deg)')
 plt.ylabel('Crossrange (deg)')
 plt.title('Ground Track (Crossrange vs Downrange)')
-plt.grid(True); plt.axis('equal'); plt.legend()
+plt.grid(True)
+plt.axis('equal')
+plt.legend()
 
-# Plot Side View
+# Plot Side View (Altitude vs Downrange, plus target altitude if desired)
 plt.figure(figsize=(8,6))
 plt.plot(case_A['theta'], case_A['h'], '-', label=case_A['label'])
 plt.plot(case_B['theta'], case_B['h'], '-', label=case_B['label'])
+plt.plot(thetaT_deg, hT_m, '--', label='Target path (h)')
 plt.xlabel('Downrange (deg)')
 plt.ylabel('Altitude (m)')
 plt.title('Altitude vs Downrange')
-plt.grid(True); plt.legend()
+plt.grid(True)
+plt.legend()
 
+# 3D Plotly overlay: vehicles + target trajectory (line) + target start/end markers
 fig = go.Figure()
 
 fig.add_trace(go.Scatter3d(
@@ -566,11 +792,24 @@ fig.add_trace(go.Scatter3d(
     mode='lines', name=case_B['label'], line=dict(width=5)
 ))
 
+fig.add_trace(go.Scatter3d(
+    x=thetaT_deg, y=phiT_deg, z=hT_m,
+    mode='lines', name='Target path', line=dict(width=4, dash='dash')
+))
+fig.add_trace(go.Scatter3d(
+    x=[thetaT_deg[0]], y=[phiT_deg[0]], z=[hT_m[0]],
+    mode='markers', name='Target start', marker=dict(size=6)
+))
+fig.add_trace(go.Scatter3d(
+    x=[thetaT_deg[-1]], y=[phiT_deg[-1]], z=[hT_m[-1]],
+    mode='markers', name='Target end', marker=dict(size=6, symbol='x')
+))
+
 # Axes styling
-xmin = min(case_A['theta'].min(), case_B['theta'].min())
-xmax = max(case_A['theta'].max(), case_B['theta'].max())
-ymin = min(case_A['phi'].min(),   case_B['phi'].min())
-ymax = max(case_A['phi'].max(),   case_B['phi'].max())
+xmin = min(case_A['theta'].min(), case_B['theta'].min(), thetaT_deg.min())
+xmax = max(case_A['theta'].max(), case_B['theta'].max(), thetaT_deg.max())
+ymin = min(case_A['phi'].min(),   case_B['phi'].min(),   phiT_deg.min())
+ymax = max(case_A['phi'].max(),   case_B['phi'].max(),   phiT_deg.max())
 
 fig.update_layout(
     scene=dict(
@@ -582,7 +821,7 @@ fig.update_layout(
         aspectmode='manual',
         aspectratio=dict(x=1, y=1, z=0.5)
     ),
-    title="3D Trajectory Overlay",
+    title="3D Trajectory Overlay (Vehicles + Moving Target)",
     margin=dict(l=0, r=0, b=0, t=40)
 )
 

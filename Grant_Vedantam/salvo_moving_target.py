@@ -296,6 +296,34 @@ class FlightDynamics(om.ExplicitComponent):
         J['psidot', 'phi'] = -v * cos_gamma * cos_psi * sec_phi_sq / r
         J['psidot', 'h'] = v * cos_gamma * cos_psi * tan_phi / r**2
 
+
+class TargetMotion(om.ExplicitComponent):
+    """Constant-rate target kinematics used for a moving terminal target."""
+
+    def initialize(self):
+        self.options.declare('num_nodes', types=int)
+
+    def setup(self):
+        nn = self.options['num_nodes']
+        self.add_input('theta_T_rate', val=np.zeros(nn), units='rad/s')
+        self.add_input('phi_T_rate',   val=np.zeros(nn), units='rad/s')
+        self.add_input('h_T_rate',     val=np.zeros(nn), units='m/s')
+
+        self.add_output('theta_T_dot', val=np.zeros(nn), units='rad/s')
+        self.add_output('phi_T_dot',   val=np.zeros(nn), units='rad/s')
+        self.add_output('h_T_dot',     val=np.zeros(nn), units='m/s')
+
+        ar = np.arange(nn, dtype=int)
+        self.declare_partials('theta_T_dot', 'theta_T_rate', rows=ar, cols=ar, val=1.0)
+        self.declare_partials('phi_T_dot',   'phi_T_rate',   rows=ar, cols=ar, val=1.0)
+        self.declare_partials('h_T_dot',     'h_T_rate',     rows=ar, cols=ar, val=1.0)
+
+    def compute(self, inputs, outputs):
+        outputs['theta_T_dot'] = inputs['theta_T_rate']
+        outputs['phi_T_dot']   = inputs['phi_T_rate']
+        outputs['h_T_dot']     = inputs['h_T_rate']
+
+
 class VehicleODE(Group):
     """
     The ODE for the Shuttle reentry problem following Vedantam & Grant (2022).
@@ -331,16 +359,82 @@ class VehicleODE(Group):
                                'gammadot', 'psidot'
                            ])
 
-def solve_vehicle(initial_phi, initial_psi, final_theta, final_phi, final_gamma, final_psi, 
-                  t_duration=250.0, label="Case"):
+        # Target motion model (for moving terminal target)
+        self.add_subsystem('target_motion',
+                           subsys=TargetMotion(num_nodes=nn),
+                           promotes_inputs=['theta_T_rate', 'phi_T_rate', 'h_T_rate'],
+                           promotes_outputs=['theta_T_dot', 'phi_T_dot', 'h_T_dot'])
+        
+        # Terminal error signals for boundary constraints: vehicle - target
+        self.add_subsystem('target_err',
+                           om.ExecComp(['theta_err = theta - theta_T',
+                                        'phi_err   = phi   - phi_T',
+                                        'h_err     = h     - h_T'],
+                                       theta=np.zeros(nn), theta_T=np.zeros(nn),
+                                       phi=np.zeros(nn),   phi_T=np.zeros(nn),
+                                       h=np.zeros(nn),     h_T=np.zeros(nn),
+                                       theta_err=np.zeros(nn), phi_err=np.zeros(nn), h_err=np.zeros(nn)),
+                           promotes_inputs=['theta', 'theta_T', 'phi', 'phi_T', 'h', 'h_T'],
+                           promotes_outputs=['theta_err', 'phi_err', 'h_err'])
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+def CirclePlot(center_x, center_y, radius_m, view='topdown', earth_radius=6371000.0, **plot_kwargs):
+    """
+    Generate x and y coordinates for a circle for plotting with plt.plot().
+
+    Parameters
+    ----------
+    center_x : float
+        Center x-coordinate (radians).
+    center_y : float
+        Center y-coordinate (radians for 'topdown', meters for 'lateral').
+    radius_m : float
+        Radius of the circle in meters.
+    view : str
+        'topdown' (crossrange vs downrange in radians) or 'lateral' (altitude vs downrange).
+    earth_radius : float
+        Radius of Earth in meters (default: 6371000).
+    **plot_kwargs : dict
+        Additional keyword arguments passed to plt.plot().
+
+    Returns
+    -------
+    None
+    """
+    theta = np.linspace(0, 2 * np.pi, 200)
+    
+    if view == 'topdown':
+        # Convert radius to radians for both axes
+        dx = (radius_m / earth_radius) * np.cos(theta)
+        dy = (radius_m / earth_radius) * np.sin(theta)
+        x = center_x + dx
+        y = center_y + dy
+    elif view == 'lateral':
+        # x is radians, y is meters
+        dx = (radius_m / earth_radius) * np.cos(theta)
+        dy = radius_m * np.sin(theta)
+        x = center_x + dx
+        y = center_y + dy
+    else:
+        raise ValueError("view must be either 'topdown' or 'lateral'")
+
+    plt.plot(x, y, **plot_kwargs)
+
+
+def solve_vehicle(initial_phi, initial_psi, final_gamma, final_psi,
+                  target, t_duration=250.0, label="Case"):
     """
     Build, solve, and simulate one vehicle trajectory, returning arrays needed for plotting.
     Only final boundary values differ between cases; initial conditions are shared.
 
     Parameters
     ----------
-    final_theta, final_phi : float (rad)
-        Desired terminal longitude/latitude.
+    target : dict
+        Target definition with keys:
+          'theta0', 'phi0', 'h0' (initial location, rad/rad/m)
+          'theta_rate', 'phi_rate', 'h_rate' (rates, rad/s, rad/s, m/s)
     final_gamma, final_psi : float (rad)
         Desired terminal flight-path angle and heading.
     t_duration : float (s)
@@ -402,11 +496,30 @@ def solve_vehicle(initial_phi, initial_psi, final_theta, final_phi, final_gamma,
 
     # Time/state/control defs
     phase0.set_time_options(fix_initial=True, fix_duration=False, units='s',
-                        duration_ref=250.0, duration_bounds=(197.802, 500.0))
+                        duration_ref=150.0, duration_bounds=(141.727, 500.0))
 
-    phase0.add_state('h',     fix_initial=True, fix_final=True,  units='m',  rate_source='hdot',     lower=0, ref=40000, defect_ref=4.0e4)
-    phase0.add_state('theta', fix_initial=True, fix_final=True,  units='rad', rate_source='thetadot', lower=0, upper=np.radians(6), defect_ref=np.radians(0.5))
-    phase0.add_state('phi',   fix_initial=True, fix_final=True,  units='rad', rate_source='phidot',   lower=-np.radians(5), upper=np.radians(5), defect_ref=np.radians(0.5))
+    phase0.add_state('h',     fix_initial=True, fix_final=False,  units='m',  rate_source='hdot',     lower=0, ref=40000, defect_ref=4.0e4)
+    phase0.add_state('theta', fix_initial=True, fix_final=False,  units='rad', rate_source='thetadot', lower=0, upper=np.radians(6), defect_ref=np.radians(0.5))
+    phase0.add_state('phi',   fix_initial=True, fix_final=False,  units='rad', rate_source='phidot',   lower=-np.radians(5), upper=np.radians(5), defect_ref=np.radians(0.5))
+
+    # --- Moving target states (Method A): evolve target inside the phase ---
+    phase0.add_state('theta_T', fix_initial=True, fix_final=False, units='rad', rate_source='theta_T_dot',
+                 lower=-np.radians(180), upper=np.radians(180), defect_ref=np.radians(0.5))
+    phase0.add_state('phi_T',   fix_initial=True, fix_final=False, units='rad', rate_source='phi_T_dot',
+                 lower=-np.radians(90), upper=np.radians(90), defect_ref=np.radians(0.5))
+    phase0.add_state('h_T',     fix_initial=True, fix_final=False, units='m',   rate_source='h_T_dot',
+                 lower=-1.0e3, upper=2.0e5, defect_ref=4.0e4)
+
+    # Target rates (constant).
+    phase0.add_parameter('theta_T_rate', opt=False, val=target['theta_rate'], units='rad/s')
+    phase0.add_parameter('phi_T_rate',   opt=False, val=target['phi_rate'],   units='rad/s')
+    phase0.add_parameter('h_T_rate',     opt=False, val=target['h_rate'],     units='m/s')
+
+    # Enforce vehicle hits the moving target at final time (vehicle - target = 0 at tf)
+    phase0.add_boundary_constraint('theta_err', loc='final', equals=0.0, units='rad')
+    phase0.add_boundary_constraint('phi_err',   loc='final', equals=0.0, units='rad')
+    phase0.add_boundary_constraint('h_err',     loc='final', equals=0.0, units='m')
+
     phase0.add_state('v',     fix_initial=True, fix_final=False, units='m/s', rate_source='vdot',     lower=0, ref=2000, defect_ref=2000)
     phase0.add_state('gamma', fix_initial=True, fix_final=False,  units='rad', rate_source='gammadot', lower=-np.radians(89), upper=np.radians(89), defect_ref=np.radians(1))
     phase0.add_state('psi',   fix_initial=True, fix_final=False,  units='rad', rate_source='psidot',   lower=-np.radians(90), upper=np.radians(90), defect_ref=np.radians(1))
@@ -420,13 +533,19 @@ def solve_vehicle(initial_phi, initial_psi, final_theta, final_phi, final_gamma,
 
     # Initial and terminal boundary values (share initial, vary final)
     phase0.set_time_val(initial=0.0, duration=t_duration, units='s')
-    # Initials
+    # Initials (same for both vehicles)
     phase0.set_state_val('h',     [40000.0, 0.0],           units='m')
-    phase0.set_state_val('theta', [0.0,     final_theta],   units='rad')
-    phase0.set_state_val('phi',   [initial_phi,     final_phi],     units='rad')
+    phase0.set_state_val('theta', [0.0, target['theta0'] + target['theta_rate'] * t_duration], units='rad')
+    phase0.set_state_val('phi',   [initial_phi, target['phi0'] + target['phi_rate'] * t_duration], units='rad')
     phase0.set_state_val('v',     [2000.0,  800.0],        units='m/s')   # final free but initialized
     phase0.set_state_val('gamma', [0.0,     final_gamma],   units='rad')
     phase0.set_state_val('psi',   [initial_psi, final_psi], units='rad')
+
+    # Target initial condition at t=0 and a consistent end guess at t=t_duration.
+    phase0.set_state_val('theta_T', [target['theta0'], target['theta0'] + target['theta_rate'] * t_duration], units='rad')
+    phase0.set_state_val('phi_T',   [target['phi0'],   target['phi0']   + target['phi_rate']   * t_duration], units='rad')
+    phase0.set_state_val('h_T',     [target['h0'],     target['h0']     + target['h_rate']     * t_duration], units='m')
+
 
     # Control initial guesses
     phase0.set_control_val('sigma', [np.radians(0.0), np.radians(0.0)])
@@ -470,40 +589,50 @@ def ts(case, var):
     y = sim.get_val(f'traj.phase0.timeseries.{var}').ravel()
     return t, y
 
-# Define two terminal-condition variants
-case_A = solve_vehicle(initial_phi = np.radians(2.0),
-                       initial_psi = -np.radians(75.0),
-                       final_theta=np.radians(1.5),
-                       final_phi=np.radians(1.0),
-                       final_gamma=-np.radians(45),
-                       final_psi=np.radians(85),
-                       label="Vehicle A")
 
-# Record the A trajectory
-A_sim = case_A['sim']
-theta_A = A_sim.get_val('traj.phase0.timeseries.theta').ravel()
-phi_A   = A_sim.get_val('traj.phase0.timeseries.phi').ravel()
-h_A     = A_sim.get_val('traj.phase0.timeseries.h').ravel()
+# === Shared moving target definition (used by both Vehicle A and B) ===
+EARTH_RADIUS_M = 6_371_000.0
+TARGET_THETA0 = np.radians(1.5)   # initial downrange of the target (rad)
+TARGET_PHI0   = np.radians(1.0)   # initial crossrange of the target (rad)
+TARGET_H0     = 0.0               # target altitude (m)
 
-earth_radius=6_371_000.0
-case_B = solve_vehicle(initial_phi = 0.0/earth_radius,
-                       initial_psi = np.radians(75.0),
-                       final_theta=np.radians(1.5),
-                       final_phi=np.radians(1.0),
+TARGET_V_CROSS_MPS = 40.0         # target motion in +crossrange direction (m/s)
+TARGET_V_DOWN_MPS = -40.0         # target motion in +crossrange direction (m/s)
+TARGET_THETA_RATE  = TARGET_V_DOWN_MPS / EARTH_RADIUS_M
+TARGET_PHI_RATE    = TARGET_V_CROSS_MPS / EARTH_RADIUS_M
+TARGET_H_RATE      = 0.0
+
+TARGET = dict(theta0=TARGET_THETA0, phi0=TARGET_PHI0, h0=TARGET_H0,
+              theta_rate=TARGET_THETA_RATE, phi_rate=TARGET_PHI_RATE, h_rate=TARGET_H_RATE)
+
+# Define two terminal-condition variants (same target for both)
+case_A = solve_vehicle(initial_phi=np.radians(2.0),
+                       initial_psi=-np.radians(10.0),
                        final_gamma=-np.radians(45),
                        final_psi=-np.radians(85),
+                       target=TARGET,
+                       label="Vehicle A")
+
+case_B = solve_vehicle(initial_phi=np.radians(0.0),
+                       initial_psi=np.radians(10.0),
+                       final_gamma=-np.radians(45),
+                       final_psi=np.radians(45),
+                       target=TARGET,
                        label="Vehicle B")
 
-B_sim = case_B['sim']
-tB    = B_sim.get_val('traj.phase0.timeseries.time').ravel()
+# --- Target trajectory from the simulation timeseries (same for both cases) ---
+T_sim = case_A['sim']
+tT = T_sim.get_val('traj.phase0.timeseries.time').ravel()
+thetaT_deg = np.degrees(T_sim.get_val('traj.phase0.timeseries.theta_T')).ravel()
+phiT_deg   = np.degrees(T_sim.get_val('traj.phase0.timeseries.phi_T')).ravel()
+hT_m       = T_sim.get_val('traj.phase0.timeseries.h_T').ravel()
 
+# Helpers to grab control histories
 tA, alphaA = ts(case_A, 'alpha')
 tB, alphaB = ts(case_B, 'alpha')
-
 tA_s, sigmaA = ts(case_A, 'sigma')
 tB_s, sigmaB = ts(case_B, 'sigma')
 
-# Convert to degrees
 alphaA_deg = np.degrees(alphaA)
 alphaB_deg = np.degrees(alphaB)
 sigmaA_deg = np.degrees(sigmaA)
@@ -513,7 +642,6 @@ print("\n=== Impact Times ===")
 print(f"Vehicle A impact time: {case_A['t_final']:.3f} s")
 print(f"Vehicle B impact time: {case_B['t_final']:.3f} s")
 print(f"Δt (B - A): {case_B['t_final'] - case_A['t_final']:.6f} s")
-
 
 # Plot α vs time
 plt.figure(figsize=(8,5))
@@ -537,24 +665,32 @@ plt.grid(True)
 plt.legend()
 plt.tight_layout()
 
-# Plot Top Down View
+# Plot Top Down View (include the moving target path + start/end markers)
 plt.figure(figsize=(8,6))
-plt.plot(case_A['theta'], case_A['phi'], '-',  label=case_A['label'])
-plt.plot(case_B['theta'], case_B['phi'], '-',  label=case_B['label'])
+plt.plot(case_A['theta'], case_A['phi'], '-', label=case_A['label'])
+plt.plot(case_B['theta'], case_B['phi'], '-', label=case_B['label'])
+plt.plot(thetaT_deg, phiT_deg, '--', label='Target path')
+plt.plot(thetaT_deg[0],  phiT_deg[0],  'o', label='Target start')
+plt.plot(thetaT_deg[-1], phiT_deg[-1], 'x', label='Target end')
 plt.xlabel('Downrange (deg)')
 plt.ylabel('Crossrange (deg)')
 plt.title('Ground Track (Crossrange vs Downrange)')
-plt.grid(True); plt.axis('equal'); plt.legend()
+plt.grid(True)
+plt.axis('equal')
+plt.legend()
 
-# Plot Side View
+# Plot Side View (Altitude vs Downrange, plus target altitude if desired)
 plt.figure(figsize=(8,6))
 plt.plot(case_A['theta'], case_A['h'], '-', label=case_A['label'])
 plt.plot(case_B['theta'], case_B['h'], '-', label=case_B['label'])
+plt.plot(thetaT_deg, hT_m, '--', label='Target path (h)')
 plt.xlabel('Downrange (deg)')
 plt.ylabel('Altitude (m)')
 plt.title('Altitude vs Downrange')
-plt.grid(True); plt.legend()
+plt.grid(True)
+plt.legend()
 
+# 3D Plotly overlay: vehicles + target trajectory (line) + target start/end markers
 fig = go.Figure()
 
 fig.add_trace(go.Scatter3d(
@@ -566,11 +702,24 @@ fig.add_trace(go.Scatter3d(
     mode='lines', name=case_B['label'], line=dict(width=5)
 ))
 
+fig.add_trace(go.Scatter3d(
+    x=thetaT_deg, y=phiT_deg, z=hT_m,
+    mode='lines', name='Target path', line=dict(width=4, dash='dash')
+))
+fig.add_trace(go.Scatter3d(
+    x=[thetaT_deg[0]], y=[phiT_deg[0]], z=[hT_m[0]],
+    mode='markers', name='Target start', marker=dict(size=6)
+))
+fig.add_trace(go.Scatter3d(
+    x=[thetaT_deg[-1]], y=[phiT_deg[-1]], z=[hT_m[-1]],
+    mode='markers', name='Target end', marker=dict(size=6, symbol='x')
+))
+
 # Axes styling
-xmin = min(case_A['theta'].min(), case_B['theta'].min())
-xmax = max(case_A['theta'].max(), case_B['theta'].max())
-ymin = min(case_A['phi'].min(),   case_B['phi'].min())
-ymax = max(case_A['phi'].max(),   case_B['phi'].max())
+xmin = min(case_A['theta'].min(), case_B['theta'].min(), thetaT_deg.min())
+xmax = max(case_A['theta'].max(), case_B['theta'].max(), thetaT_deg.max())
+ymin = min(case_A['phi'].min(),   case_B['phi'].min(),   phiT_deg.min())
+ymax = max(case_A['phi'].max(),   case_B['phi'].max(),   phiT_deg.max())
 
 fig.update_layout(
     scene=dict(
@@ -582,7 +731,7 @@ fig.update_layout(
         aspectmode='manual',
         aspectratio=dict(x=1, y=1, z=0.5)
     ),
-    title="3D Trajectory Overlay",
+    title="3D Trajectory Overlay (Vehicles + Moving Target)",
     margin=dict(l=0, r=0, b=0, t=40)
 )
 
