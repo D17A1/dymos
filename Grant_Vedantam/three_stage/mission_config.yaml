@@ -1,0 +1,95 @@
+# Example YAML configuration for the three-stage mission runner.
+# Angles are in degrees unless a field name explicitly says radians.
+
+run:
+  # true = run Dymos optimizations from scratch
+  # false = load existing Dymos recorder folders listed in dymos_folders
+  run_dymos: true
+  synchronize_salvo: true
+  show_plots: true
+  browser_3d: true
+  output_prefix: three_stage_mission
+
+stage_times:
+  reveal_time_s: 50.0
+  pn_handoff_before_impact_s: 10.0
+
+# Dymos mission targets.
+target:
+  initial_guess:
+    theta_deg: 2.01
+    phi_deg: 1.05
+    h_m: 0.0
+  updated:
+    theta_deg: 2.0
+    phi_deg: 1.0
+    h_m: 0.0
+
+vehicles:
+  A:
+    initial:
+      h_m: 40000.0
+      theta_deg: 0.0
+      phi_deg: 1.7
+      v_mps: 2000.0
+      gamma_deg: 0.0
+      psi_deg: 0.0
+  B:
+    initial:
+      h_m: 40000.0
+      theta_deg: 0.0
+      phi_deg: 0.0
+      v_mps: 2000.0
+      gamma_deg: 0.0
+      psi_deg: 0.0
+
+terminal_guess:
+  gamma_deg: -45.0
+  psi_deg: 0.0
+  v_mps: 800.0
+
+# Dymos solver/transcription/bounds.  These are optional; defaults are used if omitted.
+dymos_solver:
+  optimizer: IPOPT
+  duration_ref_s: 250.0
+  duration_bounds_s: [182.0, 500.0]
+  objective: maximize_final_velocity
+  # objective: minimize_time
+  num_segments_ipopt: 10
+  check_setup: true
+  simulate: true
+  state_bounds_deg:
+    theta: [0.0, 6.0]
+    phi: [-5.0, 5.0]
+    gamma: [-89.0, 89.0]
+    psi: [-90.0, 90.0]
+  control_bounds_deg:
+    sigma: [-165.0, 165.0]
+    alpha: [0.0, 40.0]
+
+# Used only when run.run_dymos is false.
+# Point each key at the output folder containing dymos_solution.db and traj_simulation_0_out/dymos_simulation.db.
+dymos_folders:
+  A1: main_dymos_mission_example_out
+  B1: main_dymos_mission_example4_out
+  A2: main_dymos_mission_example10_out
+  B2: main_dymos_mission_example13_out
+
+# PN terminal model. Target starts at the updated target location.
+pronav:
+  enabled: true
+  N: 3.0
+  t_final_s: 10.0
+  intercept_radius_m: 5.0
+  target_speed_mps: 0.0
+  target_heading_deg: 0.0
+  alpha_max_deg: 30.0
+  sigma_max_deg: 180.0
+  num_time_points: 1000
+  rtol: 1.0e-6
+  atol: 1.0e-8
+  max_step_s: null
+  reference:
+    # target = updated means the local PN origin is near the updated target.
+    # This keeps PN local x/y values small and improves numerical conditioning.
+    mode: updated_target
